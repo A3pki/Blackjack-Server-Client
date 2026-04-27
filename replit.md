@@ -25,3 +25,14 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - `pnpm --filter @workspace/api-server run dev` — run API server locally
 
 See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details.
+
+## Python Blackjack Desktop App
+
+A standalone Python project lives in `blackjack/` (independent of the pnpm
+workspace). It is a multi-client, encrypted, GUI-based Blackjack game.
+
+- Stack: Python 3.11, Tkinter, raw sockets, threads, `cryptography` (RSA + Fernet).
+- Run server: `python -m blackjack.run_server`
+- Run client: `python -m blackjack.run_client` (one per player)
+- Profiles + RSA key are stored in `blackjack/data/` (auto-created, gitignored).
+- See `blackjack/README.md` for full details.
