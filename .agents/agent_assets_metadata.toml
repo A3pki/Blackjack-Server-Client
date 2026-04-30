@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "UEIrjJp0oFxoWaFlbCKPA"
+uri = "file://blackjack/תיק_פרויקט.md"
+type = "text"
+title = "תיק פרויקט - בלאק'ג'ק רב-משתתפים"
