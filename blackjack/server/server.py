@@ -16,6 +16,7 @@ import time
 from typing import Dict, List, Optional
 
 from ..common.crypto import RSAKeyPair
+from .chat_filter import is_allowed
 from .client_handler import ClientHandler
 from .game import Phase, Table, _PendingResult
 from .profile_manager import ProfileManager
@@ -167,6 +168,21 @@ class BlackjackServer:
 
     def handle_chat(self, handler: ClientHandler, message: str) -> None:
         assert handler.username is not None
+
+        allowed, reason = is_allowed(message)
+        if not allowed:
+            log.info(
+                "chat blocked for %s (reason: %s): %r",
+                handler.username, reason, message[:60],
+            )
+            handler.send("error", {
+                "message": (
+                    "Your message was blocked by the chat filter. "
+                    "Please keep the chat friendly and on-topic."
+                )
+            })
+            return
+
         payload = {"from": handler.username, "message": message}
         with self._clients_lock:
             recipients = list(self._online_usernames.values())
