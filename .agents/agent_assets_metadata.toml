@@ -6,3 +6,9 @@ id = "UEIrjJp0oFxoWaFlbCKPA"
 uri = "file://blackjack/תיק_פרויקט.md"
 type = "text"
 title = "תיק פרויקט - בלאק'ג'ק רב-משתתפים"
+
+[[outputs]]
+id = "Hc_rTDEjzbJQAwFLiD_cT"
+uri = "file://blackjack/תיק_פרויקט.pdf"
+type = "pdf"
+title = "תיק פרויקט בלאק'ג'ק (PDF)"
