@@ -12,3 +12,9 @@ id = "Hc_rTDEjzbJQAwFLiD_cT"
 uri = "file://blackjack/תיק_פרויקט.pdf"
 type = "pdf"
 title = "תיק פרויקט בלאק'ג'ק (PDF)"
+
+[[outputs]]
+id = "VzBbd1WMo4hWUtVk8XbIt"
+uri = "file://blackjack/תיק_פרויקט.docx"
+type = "word_document"
+title = "תיק פרויקט בלאק'ג'ק (.docx)"
