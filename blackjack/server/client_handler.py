@@ -10,12 +10,15 @@ from typing import TYPE_CHECKING, Optional
 from ..common import protocol
 from ..common.crypto import RSAKeyPair, SecureChannel
 from ..common.protocol import ProtocolError
+from .chat_moderator import ChatModerator
 from .profile_manager import ProfileManager, UserProfile
 
 if TYPE_CHECKING:
     from .server import BlackjackServer
 
 log = logging.getLogger(__name__)
+
+_moderator = ChatModerator()
 
 
 class ClientHandler(threading.Thread):
@@ -139,7 +142,12 @@ class ClientHandler(threading.Thread):
             self._require_auth()
             text = str(data.get("message", "")).strip()
             if text:
-                self._server.handle_chat(self, text[:200])
+                text = text[:200]
+                allowed, reason = _moderator.check(text)
+                if not allowed:
+                    self.send("error", {"message": reason})
+                else:
+                    self._server.handle_chat(self, text)
         elif msg_type == "logout":
             self._require_auth()
             self.shutdown()
