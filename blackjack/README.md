@@ -21,7 +21,7 @@ Built around a custom JSON line protocol carried over an encrypted TCP channel
 ## Requirements
 
 ```bash
-pip install cryptography
+pip install cryptography google-genai
 ```
 
 (Tkinter ships with the standard CPython distribution on Windows / macOS, and
@@ -29,42 +29,72 @@ is available as `python3-tk` on most Linux distros.)
 
 ## Running
 
-In one terminal start the server:
+### Server — headless (original)
 
 ```bash
 python -m blackjack.run_server
 ```
 
-In one or more other terminals start a client per player:
+### Server — with GUI dashboard
+
+```bash
+python -m blackjack.run_server_gui
+```
+
+The GUI dashboard shows:
+- Your machine's local IP, host and port (so clients know where to connect)
+- Live player list with credits and win %
+- Kick button per player
+- Game phase + cards remaining in the deck
+- Gemini AI moderation counter (messages checked / blocked)
+- Scrollable server log with colour-coded severity
+- Stop Server button
+
+### Client (one per player)
 
 ```bash
 python -m blackjack.run_client
 ```
 
-By default the server listens on `127.0.0.1:5050`. Set `BJ_HOST` / `BJ_PORT`
+By default the server listens on `0.0.0.0:5050`. Set `BJ_HOST` / `BJ_PORT`
 environment variables to override.
+
+### Gemini AI chat filter (optional)
+
+Set `GEMINI_API_KEY` before starting the server to enable automatic screening
+of chat messages for vulgar or hateful content. See `GEMINI_SETUP.md` for
+step-by-step instructions on obtaining a free key.
+
+```bash
+export GEMINI_API_KEY="AIzaSy..."
+python -m blackjack.run_server_gui
+```
 
 ## Project layout
 
 ```
 blackjack/
-├── common/          # Shared code: cards, protocol, crypto
+├── common/              # Shared code: cards, protocol, crypto
 │   ├── card.py
 │   ├── deck.py
 │   ├── hand.py
 │   ├── protocol.py
 │   └── crypto.py
-├── server/          # Server-side code
+├── server/              # Server-side code
 │   ├── profile_manager.py
 │   ├── game.py
 │   ├── client_handler.py
+│   ├── chat_moderator.py   ← Gemini AI content filter
+│   ├── gui.py              ← Server dashboard UI
 │   └── server.py
-├── client/          # Client-side code
+├── client/              # Client-side code
 │   ├── network.py
 │   └── gui.py
-├── data/            # Created at runtime (profiles + RSA key)
-├── run_server.py
-└── run_client.py
+├── data/                # Created at runtime (profiles + RSA key)
+├── run_server.py        # Headless server entry point
+├── run_server_gui.py    # GUI server entry point
+├── run_client.py
+└── GEMINI_SETUP.md      # API key setup instructions
 ```
 
 ## Security notes
