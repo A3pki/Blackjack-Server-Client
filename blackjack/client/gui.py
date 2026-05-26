@@ -5,6 +5,7 @@ Architecture
 
 * :class:`AppController` owns the Tk root and the network client. It dispatches
   server messages onto the GUI thread via ``root.after(0, ...)``.
+* :class:`ConnectFrame` is the first screen — asks for server host and port.
 * :class:`LoginFrame` handles authentication.
 * :class:`TableFrame` shows the active Blackjack table.
 
@@ -53,6 +54,62 @@ def _format_card(card: dict) -> tuple[str, str]:
 
 
 # --- frames --------------------------------------------------------------
+
+class ConnectFrame(ttk.Frame):
+    """First screen — lets the player enter the server host and port."""
+
+    def __init__(self, master: tk.Misc, controller: "AppController",
+                 default_host: str, default_port: int) -> None:
+        super().__init__(master, padding=24)
+        self._controller = controller
+
+        title = ttk.Label(self, text="BLACKJACK", style="Title.TLabel")
+        subtitle = ttk.Label(self, text="Join a server to play",
+                             style="Subtitle.TLabel")
+        title.grid(row=0, column=0, columnspan=2, pady=(0, 4))
+        subtitle.grid(row=1, column=0, columnspan=2, pady=(0, 24))
+
+        ttk.Label(self, text="Server host", style="Body.TLabel").grid(
+            row=2, column=0, sticky="w", pady=4)
+        self._host_var = tk.StringVar(value=default_host)
+        host_entry = ttk.Entry(self, textvariable=self._host_var, width=28)
+        host_entry.grid(row=2, column=1, sticky="ew", pady=4)
+        host_entry.focus_set()
+
+        ttk.Label(self, text="Port", style="Body.TLabel").grid(
+            row=3, column=0, sticky="w", pady=4)
+        self._port_var = tk.StringVar(value=str(default_port))
+        ttk.Entry(self, textvariable=self._port_var, width=28).grid(
+            row=3, column=1, sticky="ew", pady=4)
+
+        ttk.Button(self, text="Join Game", command=self._join).grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=(20, 8))
+
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._status_var,
+                  style="Status.TLabel").grid(row=5, column=0, columnspan=2,
+                                              pady=(8, 0))
+
+        self.columnconfigure(1, weight=1)
+        self.bind_all("<Return>", lambda _e: self._join())
+
+    def show_status(self, text: str) -> None:
+        self._status_var.set(text)
+
+    def _join(self) -> None:
+        host = self._host_var.get().strip()
+        if not host:
+            self.show_status("Enter a server address.")
+            return
+        try:
+            port = int(self._port_var.get().strip())
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            self.show_status("Port must be a number between 1 and 65535.")
+            return
+        self._controller.do_connect(host, port)
+
 
 class LoginFrame(ttk.Frame):
     """Login / register screen."""
@@ -398,9 +455,12 @@ class TableFrame(ttk.Frame):
 class AppController:
     """Owns the Tk root, the network client, and routes server messages."""
 
-    def __init__(self, host: str, port: int) -> None:
-        self._host = host
-        self._port = port
+    def __init__(self, default_host: str = "127.0.0.1",
+                 default_port: int = 5050) -> None:
+        self._default_host = default_host
+        self._default_port = default_port
+        self._host: Optional[str] = None
+        self._port: Optional[int] = None
         self._root = tk.Tk()
         self._root.title("Blackjack")
         self._root.geometry("1080x720")
@@ -409,11 +469,12 @@ class AppController:
 
         self._client: Optional[BlackjackClient] = None
         self._username: Optional[str] = None
+        self._connect_frame: Optional[ConnectFrame] = None
         self._login_frame: Optional[LoginFrame] = None
         self._table_frame: Optional[TableFrame] = None
         self._message_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
 
-        self._show_login()
+        self._show_connect()
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # --- styling ------------------------------------------------------
@@ -464,6 +525,12 @@ class AppController:
             log.exception("Send failed")
             messagebox.showerror("Network error", str(exc))
 
+    def do_connect(self, host: str, port: int) -> None:
+        """Store server address and move to the login screen."""
+        self._host = host
+        self._port = port
+        self._show_login()
+
     def do_login(self, username: str, password: str) -> None:
         self._connect_then(lambda: self._client.send(  # type: ignore[union-attr]
             "login", {"username": username, "password": password},
@@ -488,6 +555,9 @@ class AppController:
     # --- connection helpers --------------------------------------------
 
     def _connect_then(self, after_connect) -> None:
+        if self._host is None or self._port is None:
+            self._show_connect()
+            return
         if self._client is not None:
             try:
                 after_connect()
@@ -504,7 +574,7 @@ class AppController:
             self._client.connect()
         except OSError as exc:
             messagebox.showerror("Cannot connect",
-                                 f"Could not reach the server:\n{exc}")
+                                 f"Could not reach {self._host}:{self._port}\n{exc}")
             self._client = None
             return
         try:
@@ -563,18 +633,41 @@ class AppController:
         self._root.after(0, lambda: self._handle_disconnect(reason))
 
     def _handle_disconnect(self, reason: Optional[str]) -> None:
+        was_logged_in = self._username is not None
         self._client = None
-        if self._username is not None:
+        self._username = None
+        if was_logged_in:
             messagebox.showinfo(
                 "Disconnected",
                 f"Connection to the server was lost.\n{reason or ''}".strip(),
             )
-        self._username = None
-        self._show_login()
+            self._show_login()
+        else:
+            # Lost connection before authentication (e.g. handshake failure)
+            if self._connect_frame is not None:
+                self._connect_frame.show_status(
+                    f"Could not connect: {reason or 'unknown error'}")
+            else:
+                self._show_connect()
 
     # --- screen swap ---------------------------------------------------
 
+    def _show_connect(self) -> None:
+        if self._table_frame is not None:
+            self._table_frame.destroy()
+            self._table_frame = None
+        if self._login_frame is not None:
+            self._login_frame.destroy()
+            self._login_frame = None
+        if self._connect_frame is None:
+            self._connect_frame = ConnectFrame(
+                self._root, self, self._default_host, self._default_port)
+        self._connect_frame.pack(fill="both", expand=True)
+
     def _show_login(self) -> None:
+        if self._connect_frame is not None:
+            self._connect_frame.destroy()
+            self._connect_frame = None
         if self._table_frame is not None:
             self._table_frame.destroy()
             self._table_frame = None

@@ -13,12 +13,12 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    host = os.environ.get("BJ_HOST", "127.0.0.1")
+    default_host = os.environ.get("BJ_HOST", "127.0.0.1")
     try:
-        port = int(os.environ.get("BJ_PORT", "5050"))
+        default_port = int(os.environ.get("BJ_PORT", "5050"))
     except ValueError:
-        port = 5050
-    AppController(host=host, port=port).run()
+        default_port = 5050
+    AppController(default_host=default_host, default_port=default_port).run()
     return 0
 
 
