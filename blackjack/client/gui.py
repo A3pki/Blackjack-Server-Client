@@ -679,6 +679,7 @@ class AppController:
         if self._login_frame is not None:
             self._login_frame.destroy()
             self._login_frame = None
+        self._root.unbind("<Return>")
         self._table_frame = TableFrame(self._root, self)
         self._table_frame.pack(fill="both", expand=True)
 
