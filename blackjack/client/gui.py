@@ -91,7 +91,7 @@ class ConnectFrame(ttk.Frame):
                                               pady=(8, 0))
 
         self.columnconfigure(1, weight=1)
-        self.bind_all("<Return>", lambda _e: self._join())
+        host_entry.bind("<Return>", lambda _e: self._join() or "break")
 
     def show_status(self, text: str) -> None:
         self._status_var.set(text)
@@ -134,8 +134,10 @@ class LoginFrame(ttk.Frame):
         ttk.Label(self, text="Password", style="Body.TLabel").grid(
             row=3, column=0, sticky="w", pady=4)
         self._password_var = tk.StringVar()
-        ttk.Entry(self, textvariable=self._password_var, show="\u2022",
-                  width=28).grid(row=3, column=1, sticky="ew", pady=4)
+        password_entry = ttk.Entry(
+            self, textvariable=self._password_var, show="\u2022", width=28
+        )
+        password_entry.grid(row=3, column=1, sticky="ew", pady=4)
 
         button_frame = ttk.Frame(self)
         button_frame.grid(row=4, column=0, columnspan=2, pady=(20, 8), sticky="ew")
@@ -152,7 +154,8 @@ class LoginFrame(ttk.Frame):
                                               pady=(8, 0))
 
         self.columnconfigure(1, weight=1)
-        self.bind_all("<Return>", lambda _e: self._login())
+        username_entry.bind("<Return>", lambda _e: self._login() or "break")
+        password_entry.bind("<Return>", lambda _e: self._login() or "break")
 
     def show_status(self, text: str, *, error: bool = False) -> None:
         self._status_var.set(text)
@@ -448,6 +451,7 @@ class TableFrame(ttk.Frame):
             return
         self._controller.send("chat", {"message": text})
         self._chat_var.set("")
+        return "break"
 
 
 # --- top-level controller -----------------------------------------------
@@ -679,7 +683,6 @@ class AppController:
         if self._login_frame is not None:
             self._login_frame.destroy()
             self._login_frame = None
-        self._root.unbind("<Return>")
         self._table_frame = TableFrame(self._root, self)
         self._table_frame.pack(fill="both", expand=True)
 
