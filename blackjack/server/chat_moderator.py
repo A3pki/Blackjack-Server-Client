@@ -98,7 +98,7 @@ class ChatModerator:
                 self._model = _build_client()
             from google.genai import types as genai_types  # type: ignore
             response = self._model.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=message,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=_SYSTEM_PROMPT,
@@ -106,7 +106,7 @@ class ChatModerator:
                 ),
             )
             verdict = (response.text or "").strip().upper()
-            if verdict == "ALLOW":
+            if verdict != "BLOCK":
                 return True, "ok"
             # Anything that is not an unambiguous ALLOW is treated as a block.
             return False, "הודעתך נחסמה בשל תוכן פוגעני או לא הולם."
