@@ -87,10 +87,6 @@ class ServerApp:
         self._server_thread: Optional[threading.Thread] = None
         self._running = False
 
-        # moderation counters (updated by _ModerationObserver)
-        self._mod_checked = 0
-        self._mod_blocked  = 0
-
         self._root = tk.Tk()
         self._root.title("Blackjack Server")
         self._root.configure(bg=BG_PANEL)
@@ -285,24 +281,6 @@ class ServerApp:
         tk.Frame(bar, bg=BG_TABLE, width=2).grid(
             row=0, column=4, sticky="ns", pady=4)
 
-        # AI moderation status
-        tk.Label(bar, text="AI Filter:", bg=BG_DARK, fg=FG_MUTED,
-                 font=("Helvetica", 10)).grid(row=0, column=5, **pad)
-        self._ai_status_var = tk.StringVar(value="OFF")
-        self._ai_status_label = tk.Label(
-            bar, textvariable=self._ai_status_var,
-            bg=BG_DARK, fg=RED, font=("Helvetica", 10, "bold"))
-        self._ai_status_label.grid(row=0, column=6, **pad)
-
-        self._ai_checked_var = tk.StringVar(value="✓ 0")
-        tk.Label(bar, textvariable=self._ai_checked_var,
-                 bg=BG_DARK, fg=GREEN_LIT,
-                 font=("Helvetica", 10)).grid(row=0, column=7, padx=(0, 4), pady=6)
-        self._ai_blocked_var = tk.StringVar(value="✗ 0")
-        tk.Label(bar, textvariable=self._ai_blocked_var,
-                 bg=BG_DARK, fg=RED,
-                 font=("Helvetica", 10)).grid(row=0, column=8, padx=(0, 12), pady=6)
-
         # stop button — pushed to the right
         self._stop_btn = ttk.Button(
             bar, text="⏹  Stop Server",
@@ -325,26 +303,6 @@ class ServerApp:
             daemon=True,
         )
         self._server_thread.start()
-        self._patch_moderator()
-
-    def _patch_moderator(self) -> None:
-        """Wrap ChatModerator.check so we can count calls in the GUI."""
-        from .client_handler import _moderator
-        original = _moderator.check
-
-        gui = self
-        def _wrapped(message: str):
-            allowed, reason = original(message)
-            gui._mod_checked += 1
-            if not allowed:
-                gui._mod_blocked += 1
-            return allowed, reason
-
-        _moderator.check = _wrapped  # type: ignore[method-assign]
-        # reflect initial AI status
-        if _moderator.enabled:
-            self._ai_status_var.set("ON")
-            self._ai_status_label.configure(fg=GREEN_LIT)
 
     def _on_stop(self) -> None:
         if not self._running:
@@ -391,7 +349,6 @@ class ServerApp:
         self._drain_logs()
         self._refresh_players()
         self._refresh_game_status()
-        self._refresh_ai_counters()
         if self._running:
             self._schedule_poll()
 
@@ -465,10 +422,6 @@ class ServerApp:
             deck  = len(table._deck)
         self._phase_var.set(phase)
         self._deck_var.set(str(deck))
-
-    def _refresh_ai_counters(self) -> None:
-        self._ai_checked_var.set(f"✓ {self._mod_checked}")
-        self._ai_blocked_var.set(f"✗ {self._mod_blocked}")
 
     # ── logging plumbing ──────────────────────────────────────────────────────
 
