@@ -1,17 +1,18 @@
-"""Persistent user profiles, stored in a JSON file.
+"""Persistent user profiles stored in a SQLite database.
 
-Each profile tracks login credentials (hashed), a credit balance, and
-win/loss counters used to compute the W/L ratio.
+The database is created automatically on first run at the path supplied to
+:class:`ProfileManager`.  A single table ``users`` holds all account data.
+All public methods acquire an ``RLock`` before touching the connection so the
+module is safe to call from multiple threads.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import re
+import sqlite3
 import threading
-from dataclasses import asdict, dataclass, field
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 from ..common.crypto import hash_password, verify_password
 
@@ -21,6 +22,17 @@ MAX_USERNAME_LEN = 16
 MIN_PASSWORD_LEN = 4
 MAX_PASSWORD_LEN = 128
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+_CREATE_TABLE = """
+CREATE TABLE IF NOT EXISTS users (
+    username      TEXT    PRIMARY KEY,
+    password_hash TEXT    NOT NULL,
+    credits       INTEGER NOT NULL DEFAULT 10000,
+    wins          INTEGER NOT NULL DEFAULT 0,
+    losses        INTEGER NOT NULL DEFAULT 0,
+    pushes        INTEGER NOT NULL DEFAULT 0
+);
+"""
 
 
 @dataclass
@@ -57,50 +69,30 @@ class UserProfile:
         }
 
 
-@dataclass
-class _ProfileStore:
-    """JSON document layout for the profiles file."""
-
-    users: Dict[str, dict] = field(default_factory=dict)
+def _row_to_profile(row: tuple) -> UserProfile:
+    username, password_hash, credits, wins, losses, pushes = row
+    return UserProfile(
+        username=username,
+        password_hash=password_hash,
+        credits=credits,
+        wins=wins,
+        losses=losses,
+        pushes=pushes,
+    )
 
 
 class ProfileManager:
-    """Thread-safe registry of :class:`UserProfile` records."""
+    """Thread-safe registry of :class:`UserProfile` records backed by SQLite."""
 
-    def __init__(self, path: str) -> None:
-        self._path = path
+    def __init__(self, db_path: str) -> None:
         self._lock = threading.RLock()
-        self._users: Dict[str, UserProfile] = {}
-        self._load()
+        # check_same_thread=False because we guard all access with our own lock.
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute(_CREATE_TABLE)
+        self._conn.commit()
 
-    # --- persistence ----------------------------------------------------
-
-    def _load(self) -> None:
-        if not os.path.exists(self._path):
-            return
-        with open(self._path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        for username, data in raw.get("users", {}).items():
-            self._users[username] = UserProfile(
-                username=username,
-                password_hash=data["password_hash"],
-                credits=int(data.get("credits", STARTING_CREDITS)),
-                wins=int(data.get("wins", 0)),
-                losses=int(data.get("losses", 0)),
-                pushes=int(data.get("pushes", 0)),
-            )
-
-    def _save_locked(self) -> None:
-        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        document = _ProfileStore(
-            users={u.username: asdict(u) for u in self._users.values()}
-        )
-        tmp = self._path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(asdict(document), f, indent=2)
-        os.replace(tmp, self._path)
-
-    # --- validation -----------------------------------------------------
+    # --- validation -------------------------------------------------------
 
     @staticmethod
     def validate_username(username: str) -> None:
@@ -122,31 +114,40 @@ class ProfileManager:
                 f"Password must be {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} chars"
             )
 
-    # --- public API -----------------------------------------------------
+    # --- public API -------------------------------------------------------
 
     def register(self, username: str, password: str) -> UserProfile:
-        """Create a brand-new account and persist it."""
+        """Create a brand-new account and persist it to the database."""
         self.validate_username(username)
         self.validate_password(password)
         with self._lock:
-            if username in self._users:
+            existing = self._conn.execute(
+                "SELECT 1 FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            if existing:
                 raise ValueError("Username already taken")
-            profile = UserProfile(
-                username=username,
-                password_hash=hash_password(password),
+            ph = hash_password(password)
+            self._conn.execute(
+                "INSERT INTO users (username, password_hash, credits, wins, losses, pushes) "
+                "VALUES (?, ?, ?, 0, 0, 0)",
+                (username, ph, STARTING_CREDITS),
             )
-            self._users[username] = profile
-            self._save_locked()
-            return profile
+            self._conn.commit()
+            return UserProfile(username=username, password_hash=ph)
 
     def authenticate(self, username: str, password: str) -> Optional[UserProfile]:
         """Return the profile if credentials match; ``None`` otherwise."""
         with self._lock:
-            profile = self._users.get(username)
-            if profile is None:
-                # Still spend the time so timing doesn't leak existence.
+            row = self._conn.execute(
+                "SELECT username, password_hash, credits, wins, losses, pushes "
+                "FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+            if row is None:
+                # Spend the same time so timing does not leak user existence.
                 verify_password(password, hash_password("dummy"))
                 return None
+            profile = _row_to_profile(row)
             if not verify_password(password, profile.password_hash):
                 return None
             return profile
@@ -154,35 +155,47 @@ class ProfileManager:
     def adjust_credits(self, username: str, delta: int) -> int:
         """Add ``delta`` (may be negative) to the user's balance and persist."""
         with self._lock:
-            profile = self._require(username)
-            new_balance = profile.credits + delta
+            row = self._conn.execute(
+                "SELECT credits FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown user: {username}")
+            new_balance = row[0] + delta
             if new_balance < 0:
                 raise ValueError("Insufficient credits")
-            profile.credits = new_balance
-            self._save_locked()
-            return profile.credits
+            self._conn.execute(
+                "UPDATE users SET credits = ? WHERE username = ?",
+                (new_balance, username),
+            )
+            self._conn.commit()
+            return new_balance
 
     def record_result(self, username: str, outcome: str) -> UserProfile:
-        """Update W/L/Push counters; ``outcome`` in ``{"win","loss","push"}``."""
+        """Increment W/L/Push counter; ``outcome`` in ``{"win","loss","push"}``."""
         if outcome not in ("win", "loss", "push"):
             raise ValueError(f"Unknown outcome: {outcome!r}")
+        col = {"win": "wins", "loss": "losses", "push": "pushes"}[outcome]
         with self._lock:
-            profile = self._require(username)
-            if outcome == "win":
-                profile.wins += 1
-            elif outcome == "loss":
-                profile.losses += 1
-            else:
-                profile.pushes += 1
-            self._save_locked()
-            return profile
+            self._conn.execute(
+                f"UPDATE users SET {col} = {col} + 1 WHERE username = ?",
+                (username,),
+            )
+            self._conn.commit()
+            return self._require(username)
 
     def get(self, username: str) -> UserProfile:
         with self._lock:
             return self._require(username)
 
+    # --- internal ---------------------------------------------------------
+
     def _require(self, username: str) -> UserProfile:
-        profile = self._users.get(username)
-        if profile is None:
+        """Fetch a profile row; raise KeyError if the user does not exist."""
+        row = self._conn.execute(
+            "SELECT username, password_hash, credits, wins, losses, pushes "
+            "FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        if row is None:
             raise KeyError(f"Unknown user: {username}")
-        return profile
+        return _row_to_profile(row)

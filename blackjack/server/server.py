@@ -25,8 +25,8 @@ log = logging.getLogger(__name__)
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5050
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-PROFILES_FILE = os.path.join(DATA_DIR, "profiles.json")
-RSA_KEY_FILE = os.path.join(DATA_DIR, "server_rsa.pem")
+PROFILES_DB   = os.path.join(DATA_DIR, "profiles.db")
+RSA_KEY_FILE  = os.path.join(DATA_DIR, "server_rsa.pem")
 
 # Pause between revealing results and starting the next round.
 RESULTS_PAUSE_SECONDS = 6.0
@@ -46,7 +46,7 @@ class BlackjackServer:
 
         os.makedirs(DATA_DIR, exist_ok=True)
         self._keypair = RSAKeyPair.load_or_create(RSA_KEY_FILE)
-        self._profiles = ProfileManager(PROFILES_FILE)
+        self._profiles = ProfileManager(PROFILES_DB)
         self._table = Table(
             broadcast=self._broadcast_state,
             on_round_finished=self._handle_round_finished,
