@@ -1,9 +1,7 @@
-"""Top-level multi-threaded Blackjack server.
+"""Top-level server — accepts connections, owns the table, and coordinates everything.
 
-* Accepts connections on a dedicated accept thread.
-* Spawns one :class:`ClientHandler` thread per connection.
-* Owns the shared :class:`Table`, :class:`ProfileManager` and RSA key pair.
-* Coordinates broadcast of game state to all logged-in clients.
+One accept thread + one ClientHandler thread per connection.
+The Table and ProfileManager are shared across all of them.
 """
 
 from __future__ import annotations
@@ -17,45 +15,47 @@ from typing import Dict, List, Optional
 
 from ..common.crypto import RSAKeyPair
 from .client_handler import ClientHandler
-from .game import Phase, Table, _PendingResult
+from .game import Phase, RoundResult, Table
 from .profile_manager import ProfileManager
 
 log = logging.getLogger(__name__)
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5050
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-PROFILES_DB   = os.path.join(DATA_DIR, "profiles.db")
-RSA_KEY_FILE  = os.path.join(DATA_DIR, "server_rsa.pem")
+DATA_DIR    = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+PROFILES_DB  = os.path.join(DATA_DIR, "profiles.db")
+RSA_KEY_FILE = os.path.join(DATA_DIR, "server_rsa.pem")
 
-# Pause between revealing results and starting the next round.
-RESULTS_PAUSE_SECONDS = 6.0
+# How long to show round results before starting the next round.
+RESULTS_PAUSE = 6.0
 
 
 class BlackjackServer:
-    """Top-level coordinator: networking + game state."""
+    """The whole server in one class — networking, game state, and player tracking."""
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+        """Set up the server. Call serve_forever() to start accepting connections."""
         self._host = host
         self._port = port
         self._listen_sock: Optional[socket.socket] = None
         self._stop_event = threading.Event()
         self._clients_lock = threading.RLock()
         self._clients: List[ClientHandler] = []
-        self._online_usernames: Dict[str, ClientHandler] = {}
+        self._online: Dict[str, ClientHandler] = {}  # username -> handler
 
         os.makedirs(DATA_DIR, exist_ok=True)
         self._keypair = RSAKeyPair.load_or_create(RSA_KEY_FILE)
         self._profiles = ProfileManager(PROFILES_DB)
         self._table = Table(
-            broadcast=self._broadcast_state,
-            on_round_finished=self._handle_round_finished,
+            broadcast=self._broadcast,
+            on_round_finished=self._on_round_finished,
         )
         self._results_timer: Optional[threading.Timer] = None
 
-    # --- lifecycle ------------------------------------------------------
+    # --- lifecycle -------------------------------------------------------
 
     def serve_forever(self) -> None:
+        """Start listening and block until stop() is called."""
         self._listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listen_sock.bind((self._host, self._port))
@@ -82,6 +82,7 @@ class BlackjackServer:
             self.stop()
 
     def stop(self) -> None:
+        """Shut down the server and disconnect all clients."""
         if self._stop_event.is_set():
             return
         self._stop_event.set()
@@ -98,36 +99,40 @@ class BlackjackServer:
         for c in clients:
             c.shutdown()
 
-    # --- client tracking -----------------------------------------------
+    # --- client tracking ------------------------------------------------
 
-    def is_username_online(self, username: str) -> bool:
+    def is_online(self, username: str) -> bool:
+        """True if a player with this username is currently connected."""
         with self._clients_lock:
-            return username in self._online_usernames
+            return username in self._online
 
-    def on_client_authenticated(self, handler: ClientHandler) -> None:
+    def on_player_joined(self, handler: ClientHandler) -> None:
+        """Called by ClientHandler after a successful login or register."""
         assert handler.username is not None
         with self._clients_lock:
-            self._online_usernames[handler.username] = handler
+            self._online[handler.username] = handler
             self._table.add_player(handler.username)
-        self._broadcast_state()
+        self._broadcast()
 
-    def on_client_disconnected(self, handler: ClientHandler) -> None:
+    def on_player_left(self, handler: ClientHandler) -> None:
+        """Called by ClientHandler when a connection closes (disconnect or logout)."""
         with self._clients_lock:
             if handler in self._clients:
                 self._clients.remove(handler)
-            if handler.username and self._online_usernames.get(handler.username) is handler:
-                self._online_usernames.pop(handler.username, None)
+            if handler.username and self._online.get(handler.username) is handler:
+                self._online.pop(handler.username, None)
                 self._table.remove_player(handler.username)
-        self._broadcast_state()
+        self._broadcast()
 
-    # --- game actions (called from client handler threads) -------------
+    # --- game actions (called from ClientHandler threads) ---------------
 
-    def handle_place_bet(self, handler: ClientHandler, amount: int) -> None:
+    def on_bet(self, handler: ClientHandler, amount: int) -> None:
+        """Handle a place_bet message — charge the player and tell the table."""
         assert handler.username is not None
         username = handler.username
         if amount <= 0:
             raise ValueError("Bet must be positive")
-        # Charge the player up-front so they cannot over-commit across rounds.
+        # Charge up front so they can't double-commit across rounds.
         try:
             new_balance = self._profiles.adjust_credits(username, -amount)
         except ValueError as exc:
@@ -135,17 +140,19 @@ class BlackjackServer:
         try:
             self._table.place_bet(username, amount, balance=new_balance)
         except (ValueError, KeyError) as exc:
-            # Refund the bet on rejection.
+            # Table rejected the bet — refund it.
             self._profiles.adjust_credits(username, amount)
             raise ValueError(str(exc))
-        # Confirm new balance to the bettor and broadcast state to everyone.
-        self._send_profile(handler)
-        self._broadcast_state()
+        # Send the updated balance back to this player, then update everyone.
+        self._push_profile(handler)
+        self._broadcast()
 
-    def handle_action(self, handler: ClientHandler, action: str) -> None:
+    def on_action(self, handler: ClientHandler, action: str) -> None:
+        """Handle a hit/stand/double action from a player."""
         assert handler.username is not None
         username = handler.username
         if action == "double":
+            # Figure out if the player can afford to match their bet.
             current_player = self._table.get_player(username)
             if current_player is None:
                 raise ValueError("You are not at the table")
@@ -155,86 +162,85 @@ class BlackjackServer:
             if can_afford:
                 self._profiles.adjust_credits(username, -extra)
             try:
-                self._table.player_action(username, action, can_afford_double=can_afford)
+                self._table.handle_action(username, action, can_afford_double=can_afford)
             except ValueError:
                 if can_afford:
-                    self._profiles.adjust_credits(username, extra)
+                    self._profiles.adjust_credits(username, extra)  # refund on error
                 raise
-            self._send_profile(handler)
+            self._push_profile(handler)
         else:
-            self._table.player_action(username, action, can_afford_double=False)
-        self._broadcast_state()
+            self._table.handle_action(username, action, can_afford_double=False)
+        self._broadcast()
 
-    def handle_chat(self, handler: ClientHandler, message: str) -> None:
+    def on_chat(self, handler: ClientHandler, message: str) -> None:
+        """Relay a chat message to every connected player."""
         assert handler.username is not None
         payload = {"from": handler.username, "message": message}
         with self._clients_lock:
-            recipients = list(self._online_usernames.values())
+            recipients = list(self._online.values())
         for c in recipients:
             try:
                 c.send("chat", payload)
-            except Exception:  # pragma: no cover - defensive
-                pass
+            except Exception:
+                pass  # don't let one broken client interrupt the others
 
-    # --- internal helpers ----------------------------------------------
+    # --- internal helpers -----------------------------------------------
 
-    def _send_profile(self, handler: ClientHandler) -> None:
+    def _push_profile(self, handler: ClientHandler) -> None:
+        """Re-send auth_result with the player's latest profile so the UI refreshes."""
         if handler.username is None:
             return
         profile = self._profiles.get(handler.username)
-        # Re-send auth_result with updated profile so the client UI refreshes.
         handler.send("auth_result", {
             "success": True,
             "message": "Profile updated",
-            "profile": profile.to_public_dict(),
+            "profile": profile.to_dict(),
         })
 
-    def _broadcast_state(self) -> None:
+    def _broadcast(self) -> None:
+        """Push a fresh game_state snapshot to every logged-in player."""
         with self._clients_lock:
-            recipients = list(self._online_usernames.values())
+            recipients = list(self._online.values())
         for handler in recipients:
             assert handler.username is not None
             snapshot = self._table.snapshot_for(handler.username)
             try:
                 handler.send("game_state", snapshot)
-            except Exception:  # pragma: no cover - defensive
-                pass
+            except Exception:
+                pass  # disconnected clients will clean themselves up
 
-    def _handle_round_finished(self, results: List[_PendingResult]) -> None:
-        # Update credits + W/L counters and tell each player the outcome.
-        per_user_results = []
+    def _on_round_finished(self, results: List[RoundResult]) -> None:
+        """Credit wins, record W/L/push stats, then send round_result to each player."""
+        per_user = []
         for r in results:
             if r.payout > 0:
                 self._profiles.adjust_credits(r.username, r.payout)
-            outcome_for_record = "win" if r.outcome == "win" else (
-                "loss" if r.outcome == "loss" else "push"
-            )
-            updated = self._profiles.record_result(r.username, outcome_for_record)
-            per_user_results.append((r, updated))
+            outcome_key = r.outcome if r.outcome in ("win", "loss", "push") else "loss"
+            updated = self._profiles.record_result(r.username, outcome_key)
+            per_user.append((r, updated))
 
-        # Push state once so everyone sees the resolved table.
-        self._broadcast_state()
+        # Show the resolved table to everyone first.
+        self._broadcast()
 
-        # Then send per-user round_result + refreshed profile.
+        # Then send each player their personal result + refreshed profile.
         with self._clients_lock:
-            online = dict(self._online_usernames)
-        for r, profile in per_user_results:
+            online = dict(self._online)
+        for r, profile in per_user:
             handler = online.get(r.username)
             if handler is None:
                 continue
             handler.send("round_result", {
                 "outcome": r.outcome,
                 "payout": r.payout,
-                "profile": profile.to_public_dict(),
+                "profile": profile.to_dict(),
             })
 
-        # Schedule next round.
-        self._results_timer = threading.Timer(
-            RESULTS_PAUSE_SECONDS, self._start_next_round,
-        )
+        # Wait a few seconds then start the next round.
+        self._results_timer = threading.Timer(RESULTS_PAUSE, self._begin_next_round)
         self._results_timer.daemon = True
         self._results_timer.start()
 
-    def _start_next_round(self) -> None:
-        self._table.prepare_next_round()
-        self._broadcast_state()
+    def _begin_next_round(self) -> None:
+        """Reset the table and let players bet again."""
+        self._table.reset_for_next_round()
+        self._broadcast()

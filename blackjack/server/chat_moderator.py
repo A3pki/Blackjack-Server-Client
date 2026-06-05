@@ -1,11 +1,7 @@
-"""Gemini-powered chat moderator.
+"""AI chat filter — screens messages for offensive content using Gemini Flash.
 
-Screens player chat messages for vulgar, hateful, or offensive content.
-Requires the ``GEMINI_API_KEY`` environment variable.
-
-If the key is absent the moderator runs in **pass-through** mode —
-all messages are allowed and a one-time warning is logged, so the game
-remains fully playable without an API key.
+If GEMINI_API_KEY isn't set, the moderator just lets everything through
+and logs a warning. The game still works fine without it.
 """
 
 from __future__ import annotations
@@ -16,7 +12,7 @@ from typing import Tuple
 
 log = logging.getLogger(__name__)
 
-_WARN_LOGGED = False
+_warned_about_key = False  # only log the missing-key warning once
 
 _SYSTEM_PROMPT = """\
 You are a strict content moderator for an online multiplayer card game chat.
@@ -43,61 +39,58 @@ Reply with exactly one word — ALLOW or BLOCK — no punctuation, no explanatio
 """
 
 
-def _build_client():
-    """Create and return a configured Gemini client."""
+def _make_gemini_client():
+    """Create and return a configured Gemini client using the API key from env."""
     from google import genai  # type: ignore
-
     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
 class ChatModerator:
     """AI-powered chat filter backed by Gemini Flash.
 
-    Create one instance per server (or one module-level singleton).
-    The underlying SDK client is created lazily on the first ``check()``
-    call so startup is not delayed when moderation is disabled.
+    Instantiate once per server (or use the module-level singleton in
+    client_handler.py). The Gemini client is created lazily on the first
+    check() call so the server starts up fast even without a key.
 
-    Example::
-
+    Usage:
         moderator = ChatModerator()
-        allowed, reason = moderator.check("your message here")
+        allowed, reason = moderator.check("some message here")
         if not allowed:
             handler.send("error", {"message": reason})
     """
 
     def __init__(self) -> None:
-        global _WARN_LOGGED
+        """Set up the moderator. Warns once if GEMINI_API_KEY is missing."""
+        global _warned_about_key
         self._enabled = bool(os.environ.get("GEMINI_API_KEY", "").strip())
-        if not self._enabled and not _WARN_LOGGED:
+        if not self._enabled and not _warned_about_key:
             log.warning(
-                "GEMINI_API_KEY is not set – AI chat moderation is disabled. "
-                "Set the variable and restart the server to enable content filtering."
+                "GEMINI_API_KEY not set — AI chat moderation is disabled. "
+                "Set the variable and restart the server to enable filtering."
             )
-            _WARN_LOGGED = True
-        self._model = None
+            _warned_about_key = True
+        self._client = None  # created on first use
 
     @property
     def enabled(self) -> bool:
+        """True when moderation is active (key is set)."""
         return self._enabled
 
     def check(self, message: str) -> Tuple[bool, str]:
-        """Classify *message* and return ``(allowed, reason)``.
+        """Ask Gemini whether a message is OK to broadcast.
 
-        * ``allowed=True``  → broadcast the message as normal.
-        * ``allowed=False`` → send the reason back to the sender only.
-
-        If moderation is disabled **or** the API call fails for any reason
-        (network error, quota exhausted, etc.) the message is allowed through
-        so the game remains playable.
+        Returns (True, "ok") if allowed, (False, reason) if blocked.
+        If moderation is disabled or the API call fails, the message is
+        allowed through so the game doesn't break when the API is down.
         """
         if not self._enabled:
             return True, "moderation disabled"
 
         try:
-            if self._model is None:
-                self._model = _build_client()
+            if self._client is None:
+                self._client = _make_gemini_client()
             from google.genai import types as genai_types  # type: ignore
-            response = self._model.models.generate_content(
+            response = self._client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=message,
                 config=genai_types.GenerateContentConfig(
@@ -108,10 +101,8 @@ class ChatModerator:
             verdict = (response.text or "").strip().upper()
             if verdict != "BLOCK":
                 return True, "ok"
-            # Anything that is not an unambiguous ALLOW is treated as a block.
+            # Anything other than a clear ALLOW gets blocked.
             return False, "הודעתך נחסמה בשל תוכן פוגעני או לא הולם."
         except Exception as exc:
-            log.warning(
-                "Gemini moderation call failed (%s) – message passed through.", exc
-            )
+            log.warning("Gemini moderation failed (%s) — message passed through.", exc)
             return True, "moderation error – passed through"

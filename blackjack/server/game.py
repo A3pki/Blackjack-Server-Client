@@ -1,22 +1,10 @@
-"""Server-side Blackjack game state machine.
+"""Server-side game logic: cards, bets, turns, dealer, and scoring.
 
-Concepts
---------
+Flow of a round:
+  WAITING -> BETTING -> PLAYING -> DEALER -> RESULTS -> WAITING
 
-* :class:`Participant` — base class for anyone holding cards (player / dealer).
-* :class:`Player` — a seated user with a hand, bet and outcome.
-* :class:`Dealer` — the house; subclasses :class:`Participant`.
-* :class:`Game` — orchestrates a single round across all seated players.
-* :class:`Table` — coordinates rounds, manages players joining / leaving,
-  collects bets, and runs the round when everyone is ready.
-
-Phases of a round
------------------
-
-``WAITING`` -> ``BETTING`` -> ``PLAYING`` -> ``DEALER`` -> ``RESULTS`` -> ``WAITING``
-
-The :class:`Table` is **not** thread-safe on its own; callers (the server)
-must hold ``Table.lock`` for any mutation.
+The Table class is not thread-safe on its own — callers must hold
+Table.lock before mutating anything.
 """
 
 from __future__ import annotations
@@ -31,50 +19,56 @@ from ..common.hand import Hand
 
 
 class Phase(str, Enum):
-    WAITING = "waiting"     # round not started
-    BETTING = "betting"     # waiting for everyone to place a bet
-    PLAYING = "playing"     # players take turns
-    DEALER = "dealer"       # dealer reveals + plays
-    RESULTS = "results"     # short pause to display outcomes
+    """Which stage of the round we're currently in."""
+    WAITING = "waiting"   # nobody has bet yet
+    BETTING = "betting"   # waiting for everyone to place a bet
+    PLAYING = "playing"   # players take turns hitting/standing
+    DEALER  = "dealer"    # dealer reveals + plays
+    RESULTS = "results"   # short pause so everyone can see the outcome
 
 
 # --- participants --------------------------------------------------------
 
 class Participant:
-    """Base class for anyone holding a Blackjack hand."""
+    """Base for anyone holding cards at the table (player or dealer)."""
 
     def __init__(self, name: str) -> None:
+        """Set up with a display name and an empty hand."""
         self.name = name
         self.hand = Hand()
 
     def reset(self) -> None:
+        """Clear the hand between rounds."""
         self.hand.clear()
 
 
 class Dealer(Participant):
-    """The house dealer; hits on 16, stands on 17 (including soft 17)."""
+    """The house dealer — hits on 16 or less, stands on 17 (including soft 17)."""
 
     def __init__(self) -> None:
         super().__init__(name="Dealer")
 
-    def should_hit(self) -> bool:
+    def wants_card(self) -> bool:
+        """True when the dealer's rules say they must keep hitting."""
         return self.hand.value < 17
 
 
 class Player(Participant):
-    """A seated human player."""
+    """A human player sitting at the table."""
 
     def __init__(self, username: str) -> None:
+        """Set up a fresh player slot for the given username."""
         super().__init__(name=username)
         self.username = username
         self.bet: int = 0
         self.has_bet: bool = False
-        self.is_done: bool = False           # stood / busted / blackjack / doubled
+        self.is_done: bool = False       # stood, busted, got blackjack, or doubled
         self.has_doubled: bool = False
-        self.outcome: Optional[str] = None   # "win" / "loss" / "push" / "blackjack"
-        self.payout: int = 0                 # total credits returned (bet + winnings)
+        self.outcome: Optional[str] = None   # "win" / "loss" / "push"
+        self.payout: int = 0             # credits returned at end of round
 
     def reset(self) -> None:
+        """Wipe the hand and all round-specific state. Keep the username."""
         super().reset()
         self.bet = 0
         self.has_bet = False
@@ -84,25 +78,32 @@ class Player(Participant):
         self.payout = 0
 
 
-# --- table & round orchestration ----------------------------------------
+# --- round result --------------------------------------------------------
 
 @dataclass
-class _PendingResult:
+class RoundResult:
+    """One player's outcome from a finished round."""
     username: str
-    outcome: str
-    payout: int  # total credits returned to the user
+    outcome: str   # "win" / "loss" / "push"
+    payout: int    # credits returned (0 on a loss)
 
+
+# --- table ---------------------------------------------------------------
 
 class Table:
-    """A single Blackjack table shared by all currently logged-in clients."""
+    """Manages one shared blackjack table — all players, the deck, and round flow.
+
+    The server passes in callbacks so the Table can trigger broadcasts
+    without knowing about sockets or handlers directly.
+    """
 
     MIN_BET = 50
     MAX_BET = 5_000
-    BETTING_AUTOSTART_DELAY = 0.0  # round starts as soon as everyone has bet
 
     def __init__(self,
                  broadcast: Callable[[], None],
-                 on_round_finished: Callable[[List[_PendingResult]], None]) -> None:
+                 on_round_finished: Callable[[List[RoundResult]], None]) -> None:
+        """Set up an empty table. broadcast is called whenever state changes."""
         self.lock = threading.RLock()
         self._players: Dict[str, Player] = {}
         self._dealer = Dealer()
@@ -113,55 +114,60 @@ class Table:
         self._broadcast = broadcast
         self._on_round_finished = on_round_finished
 
-    # --- accessors ------------------------------------------------------
+    # --- accessors -------------------------------------------------------
 
     @property
     def phase(self) -> Phase:
+        """Current phase of the round."""
         return self._phase
 
     def get_player(self, username: str) -> Optional[Player]:
+        """Look up a player by username. Returns None if not at the table."""
         return self._players.get(username)
 
     def current_player(self) -> Optional[Player]:
+        """Who's turn is it right now? Returns None if we're not in the PLAYING phase."""
         if self._phase != Phase.PLAYING:
             return None
         if not self._turn_order:
             return None
         return self._players.get(self._turn_order[self._turn_index])
 
-    # --- lifecycle ------------------------------------------------------
+    # --- lifecycle -------------------------------------------------------
 
     def add_player(self, username: str) -> Player:
+        """Seat a player at the table. If mid-round they just wait for the next one."""
         with self.lock:
             if username in self._players:
                 return self._players[username]
             player = Player(username)
             self._players[username] = player
-            # If we're mid-round, the new player simply waits for the next one.
+            # If the table was idle, kick it into betting phase.
             if self._phase == Phase.WAITING:
                 self._phase = Phase.BETTING
             return player
 
     def remove_player(self, username: str) -> None:
+        """Remove a player who disconnected. Advances the turn if it was their go."""
         with self.lock:
             self._players.pop(username, None)
             self._turn_order = [u for u in self._turn_order if u != username]
             if not self._players:
+                # Table is empty — reset everything.
                 self._phase = Phase.WAITING
                 self._dealer.reset()
-            else:
-                # If the leaving player was current, advance turn.
-                if self._phase == Phase.PLAYING:
-                    if self._turn_index >= len(self._turn_order):
-                        self._maybe_finish_player_phase()
+            elif self._phase == Phase.PLAYING:
+                # If the leaver was the current player, move on.
+                if self._turn_index >= len(self._turn_order):
+                    self._advance_turn()
 
-    # --- betting --------------------------------------------------------
+    # --- betting ---------------------------------------------------------
 
     def place_bet(self, username: str, amount: int, balance: int) -> None:
-        """Record a bet for ``username``.
+        """Record a bet for a player.
 
-        ``balance`` is the player's *current* credit balance (after the bet
-        has already been deducted by the caller).
+        The server already deducted the credits before calling here.
+        balance is just informational (not used by the Table itself).
         """
         with self.lock:
             if self._phase not in (Phase.BETTING, Phase.WAITING):
@@ -172,30 +178,30 @@ class Table:
             if player.has_bet:
                 raise ValueError("You already placed a bet for this round")
             if not (self.MIN_BET <= amount <= self.MAX_BET):
-                raise ValueError(
-                    f"Bet must be between {self.MIN_BET} and {self.MAX_BET}"
-                )
+                raise ValueError(f"Bet must be between {self.MIN_BET} and {self.MAX_BET}")
             player.bet = amount
             player.has_bet = True
             if self._phase == Phase.WAITING:
                 self._phase = Phase.BETTING
-            del balance  # the value is recorded by the server, not the table
+            del balance  # not stored here — the server tracks balances
 
-            if self._all_bets_in():
-                self._start_round_locked()
+            if self._everyone_bet():
+                self._begin_round()
 
-    def _all_bets_in(self) -> bool:
+    def _everyone_bet(self) -> bool:
+        """True when all seated players have placed a bet."""
         return bool(self._players) and all(p.has_bet for p in self._players.values())
 
-    # --- round flow -----------------------------------------------------
+    # --- round flow ------------------------------------------------------
 
-    def _start_round_locked(self) -> None:
+    def _begin_round(self) -> None:
+        """Deal initial cards and start the playing phase."""
         self._phase = Phase.PLAYING
         self._dealer.reset()
         self._turn_order = list(self._players.keys())
         self._turn_index = 0
 
-        # Reset hands but keep bets.
+        # Reset hands but keep the bets that were already placed.
         for player in self._players.values():
             player.hand.clear()
             player.is_done = False
@@ -203,34 +209,33 @@ class Table:
             player.outcome = None
             player.payout = 0
 
-        # Initial deal: two cards per player, then dealer.
+        # Initial deal: two cards to each player, then two to the dealer.
         for _ in range(2):
             for username in self._turn_order:
                 self._players[username].hand.add(self._deck.draw())
             self._dealer.hand.add(self._deck.draw())
 
-        # Auto-resolve naturals: a player with blackjack is immediately done.
+        # Anyone who got a natural blackjack is immediately done.
         for player in self._players.values():
             if player.hand.is_blackjack:
                 player.is_done = True
 
-        # If everyone got blackjack we skip straight to dealer phase.
-        self._maybe_finish_player_phase()
+        # If everyone got blackjack, skip straight to the dealer phase.
+        self._advance_turn()
 
-    def _maybe_finish_player_phase(self) -> None:
-        # Advance turn index past anyone already done.
+    def _advance_turn(self) -> None:
+        """Skip past any players who are already done, then run the dealer if everyone's finished."""
         while (self._turn_index < len(self._turn_order)
                and self._players[self._turn_order[self._turn_index]].is_done):
             self._turn_index += 1
         if self._turn_index >= len(self._turn_order):
-            self._run_dealer_locked()
+            self._dealer_turn()
 
-    def player_action(self, username: str, action: str,
+    def handle_action(self, username: str, action: str,
                       can_afford_double: bool) -> None:
-        """Apply a player action.
+        """Apply a hit, stand, or double action from a player.
 
-        ``can_afford_double`` is supplied by the server and reflects whether
-        the user has enough free credits to double down.
+        can_afford_double is checked by the server before calling here.
         """
         with self.lock:
             if self._phase != Phase.PLAYING:
@@ -249,12 +254,11 @@ class Table:
                 self._turn_index += 1
             elif action == "double":
                 if len(current.hand) != 2:
-                    raise ValueError("You can only double on the first move")
+                    raise ValueError("You can only double on your first move")
                 if not can_afford_double:
                     raise ValueError("Insufficient credits to double down")
                 current.has_doubled = True
-                # Caller (server) is responsible for actually charging the
-                # extra bet against the user's account; we just remember it.
+                # The server charges the extra bet — we just record it happened.
                 current.bet *= 2
                 current.hand.add(self._deck.draw())
                 current.is_done = True
@@ -262,60 +266,63 @@ class Table:
             else:
                 raise ValueError(f"Unknown action: {action!r}")
 
-            self._maybe_finish_player_phase()
+            self._advance_turn()
 
-    # --- dealer ---------------------------------------------------------
+    # --- dealer phase ----------------------------------------------------
 
-    def _run_dealer_locked(self) -> None:
+    def _dealer_turn(self) -> None:
+        """Run the dealer's hand, then score everyone."""
         self._phase = Phase.DEALER
-        # Only play out the dealer if at least one player isn't busted.
+        # Only draw cards if at least one player is still alive (not busted / not BJ).
         any_alive = any(
-            (not p.hand.is_bust) and (not p.hand.is_blackjack)
+            not p.hand.is_bust and not p.hand.is_blackjack
             for p in self._players.values()
         )
-        # We still reveal naturals even if no one is alive -> always play
-        # at least once so the second card is "shown".
         if any_alive:
-            while self._dealer.should_hit():
+            while self._dealer.wants_card():
                 self._dealer.hand.add(self._deck.draw())
 
-        results = self._resolve_locked()
+        results = self._score_round()
         self._phase = Phase.RESULTS
         self._on_round_finished(results)
 
-    def _resolve_locked(self) -> List[_PendingResult]:
-        dealer_value = self._dealer.hand.value
-        dealer_bj = self._dealer.hand.is_blackjack
+    def _score_round(self) -> List[RoundResult]:
+        """Compare each player's hand to the dealer and build the result list."""
+        dealer_val = self._dealer.hand.value
+        dealer_bj  = self._dealer.hand.is_blackjack
         dealer_bust = self._dealer.hand.is_bust
-        results: List[_PendingResult] = []
+        results: List[RoundResult] = []
+
         for player in self._players.values():
             payout = 0
             if player.hand.is_blackjack and not dealer_bj:
                 outcome = "win"
-                payout = int(player.bet * 2.5)  # 1:1 + 1.5x bonus = 2.5x bet returned
+                payout = int(player.bet * 2.5)  # 3:2 payout — bet returned + 1.5× bonus
             elif player.hand.is_blackjack and dealer_bj:
                 outcome = "push"
                 payout = player.bet
             elif player.hand.is_bust:
                 outcome = "loss"
-            elif dealer_bust or player.hand.value > dealer_value:
+            elif dealer_bust or player.hand.value > dealer_val:
                 outcome = "win"
                 payout = player.bet * 2
-            elif player.hand.value == dealer_value:
+            elif player.hand.value == dealer_val:
                 outcome = "push"
                 payout = player.bet
             else:
                 outcome = "loss"
+
             player.outcome = outcome
             player.payout = payout
-            results.append(_PendingResult(
+            results.append(RoundResult(
                 username=player.username, outcome=outcome, payout=payout,
             ))
         return results
 
-    # --- prepare next round --------------------------------------------
+    # --- next round ------------------------------------------------------
 
-    def prepare_next_round(self) -> None:
+    def reset_for_next_round(self) -> None:
+        """Clear all round state so players can bet again."""
         with self.lock:
             for player in self._players.values():
                 player.reset()
@@ -324,22 +331,25 @@ class Table:
             self._turn_index = 0
             self._phase = Phase.BETTING if self._players else Phase.WAITING
 
-    # --- snapshot for clients ------------------------------------------
+    # --- snapshot for clients -------------------------------------------
 
     def snapshot_for(self, username: str) -> dict:
-        """Return the table state from ``username``'s point of view."""
+        """Build the full table state from one player's point of view.
+
+        Hides the dealer's hole card during the playing phase.
+        """
         with self.lock:
             current = self.current_player()
             current_username = current.username if current else None
 
-            # Hide dealer's hole card during the playing phase.
+            # During play, show only the dealer's face-up card.
             if self._phase in (Phase.PLAYING, Phase.BETTING, Phase.WAITING):
                 dealer_cards = (
                     [self._dealer.hand.cards[0].to_dict(), {"rank": "?", "suit": "?"}]
                     if len(self._dealer.hand) >= 1 else []
                 )
                 dealer_value = (
-                    self._dealer.hand.cards[0].base_value
+                    self._dealer.hand.cards[0].point_value
                     if len(self._dealer.hand) >= 1 else 0
                 )
                 dealer_value_hidden = True
@@ -364,6 +374,7 @@ class Table:
                     "is_blackjack": p.hand.is_blackjack,
                     "is_bust": p.hand.is_bust,
                 })
+
             return {
                 "phase": self._phase.value,
                 "min_bet": self.MIN_BET,

@@ -1,4 +1,4 @@
-"""Playing card abstraction."""
+"""A single playing card — rank + suit, immutable."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from typing import ClassVar
 
 @dataclass(frozen=True)
 class Card:
-    """A single playing card.
+    """One card in the deck.
 
-    Cards are immutable value objects: equality and hashing rely on
-    ``rank`` and ``suit`` only.
+    Frozen dataclass so cards are hashable and you can't accidentally
+    mutate them once dealt.
     """
 
     SUITS: ClassVar[tuple[str, ...]] = ("S", "H", "D", "C")
@@ -29,8 +29,8 @@ class Card:
             raise ValueError(f"Invalid suit: {self.suit!r}")
 
     @property
-    def base_value(self) -> int:
-        """Blackjack base value (Ace counted as 1 here; Hand handles soft 11)."""
+    def point_value(self) -> int:
+        """Raw blackjack value — aces count as 1 here; Hand bumps them to 11."""
         if self.rank == "A":
             return 1
         if self.rank in ("J", "Q", "K"):
@@ -39,13 +39,16 @@ class Card:
 
     @property
     def is_ace(self) -> bool:
+        """True if this card is an ace."""
         return self.rank == "A"
 
     def to_dict(self) -> dict:
+        """Serialize to a plain dict for sending over the wire."""
         return {"rank": self.rank, "suit": self.suit}
 
     @classmethod
     def from_dict(cls, data: dict) -> "Card":
+        """Reconstruct a Card from a dict (e.g. received from the server)."""
         return cls(rank=str(data["rank"]), suit=str(data["suit"]))
 
     def __str__(self) -> str:

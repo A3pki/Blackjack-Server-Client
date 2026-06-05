@@ -1,9 +1,7 @@
-"""Persistent user profiles stored in a SQLite database.
+"""User accounts, stored in a SQLite database.
 
-The database is created automatically on first run at the path supplied to
-:class:`ProfileManager`.  A single table ``users`` holds all account data.
-All public methods acquire an ``RLock`` before touching the connection so the
-module is safe to call from multiple threads.
+One table, one file, thread-safe via an RLock.
+The DB is created automatically on first run.
 """
 
 from __future__ import annotations
@@ -37,7 +35,10 @@ CREATE TABLE IF NOT EXISTS users (
 
 @dataclass
 class UserProfile:
-    """In-memory representation of a single player's account."""
+    """Everything we know about one player's account.
+
+    Passed around in memory after loading from the DB.
+    """
 
     username: str
     password_hash: str
@@ -48,16 +49,18 @@ class UserProfile:
 
     @property
     def games_played(self) -> int:
+        """Total hands the player has finished."""
         return self.wins + self.losses + self.pushes
 
     @property
-    def wl_ratio(self) -> float:
+    def win_loss_ratio(self) -> float:
+        """Wins divided by losses — returns wins as float when losses = 0."""
         if self.losses == 0:
             return float(self.wins) if self.wins else 0.0
         return self.wins / self.losses
 
-    def to_public_dict(self) -> dict:
-        """Profile fields safe to send to the client (no password hash)."""
+    def to_dict(self) -> dict:
+        """Safe subset of the profile to send to the client — no password hash."""
         return {
             "username": self.username,
             "credits": self.credits,
@@ -65,11 +68,12 @@ class UserProfile:
             "losses": self.losses,
             "pushes": self.pushes,
             "games_played": self.games_played,
-            "wl_ratio": round(self.wl_ratio, 3),
+            "wl_ratio": round(self.win_loss_ratio, 3),
         }
 
 
-def _row_to_profile(row: tuple) -> UserProfile:
+def _profile_from_row(row: tuple) -> UserProfile:
+    """Turn a raw DB row tuple into a UserProfile object."""
     username, password_hash, credits, wins, losses, pushes = row
     return UserProfile(
         username=username,
@@ -82,11 +86,16 @@ def _row_to_profile(row: tuple) -> UserProfile:
 
 
 class ProfileManager:
-    """Thread-safe registry of :class:`UserProfile` records backed by SQLite."""
+    """Thread-safe interface to the users table in profiles.db.
+
+    All writes go through an RLock so multiple client threads can call
+    this concurrently without corrupting the database.
+    """
 
     def __init__(self, db_path: str) -> None:
+        """Open (or create) the database at db_path and make sure the table exists."""
         self._lock = threading.RLock()
-        # check_same_thread=False because we guard all access with our own lock.
+        # check_same_thread=False is fine because we guard everything with our own lock.
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute(_CREATE_TABLE)
@@ -96,28 +105,30 @@ class ProfileManager:
 
     @staticmethod
     def validate_username(username: str) -> None:
+        """Raise ValueError if the username doesn't meet the rules."""
         if not isinstance(username, str):
             raise ValueError("Username must be a string")
         if not (MIN_USERNAME_LEN <= len(username) <= MAX_USERNAME_LEN):
             raise ValueError(
-                f"Username must be {MIN_USERNAME_LEN}-{MAX_USERNAME_LEN} chars"
+                f"Username must be {MIN_USERNAME_LEN}–{MAX_USERNAME_LEN} chars"
             )
         if not _USERNAME_RE.match(username):
-            raise ValueError("Username may only contain letters, digits and _")
+            raise ValueError("Username may only contain letters, digits, and _")
 
     @staticmethod
     def validate_password(password: str) -> None:
+        """Raise ValueError if the password is too short or too long."""
         if not isinstance(password, str):
             raise ValueError("Password must be a string")
         if not (MIN_PASSWORD_LEN <= len(password) <= MAX_PASSWORD_LEN):
             raise ValueError(
-                f"Password must be {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} chars"
+                f"Password must be {MIN_PASSWORD_LEN}–{MAX_PASSWORD_LEN} chars"
             )
 
     # --- public API -------------------------------------------------------
 
     def register(self, username: str, password: str) -> UserProfile:
-        """Create a brand-new account and persist it to the database."""
+        """Create a new account and write it to the DB. Raises ValueError on duplicates."""
         self.validate_username(username)
         self.validate_password(password)
         with self._lock:
@@ -136,7 +147,11 @@ class ProfileManager:
             return UserProfile(username=username, password_hash=ph)
 
     def authenticate(self, username: str, password: str) -> Optional[UserProfile]:
-        """Return the profile if credentials match; ``None`` otherwise."""
+        """Check credentials and return the profile, or None if they don't match.
+
+        Always takes the same amount of time whether the user exists or not,
+        so an attacker can't figure out which usernames are registered.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT username, password_hash, credits, wins, losses, pushes "
@@ -144,16 +159,19 @@ class ProfileManager:
                 (username,),
             ).fetchone()
             if row is None:
-                # Spend the same time so timing does not leak user existence.
+                # Burn time on a fake hash so the response time doesn't leak anything.
                 verify_password(password, hash_password("dummy"))
                 return None
-            profile = _row_to_profile(row)
+            profile = _profile_from_row(row)
             if not verify_password(password, profile.password_hash):
                 return None
             return profile
 
     def adjust_credits(self, username: str, delta: int) -> int:
-        """Add ``delta`` (may be negative) to the user's balance and persist."""
+        """Add delta (negative = deduct) to the player's balance and persist it.
+
+        Raises ValueError if the result would go below zero.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT credits FROM users WHERE username = ?", (username,)
@@ -171,7 +189,7 @@ class ProfileManager:
             return new_balance
 
     def record_result(self, username: str, outcome: str) -> UserProfile:
-        """Increment W/L/Push counter; ``outcome`` in ``{"win","loss","push"}``."""
+        """Bump the win, loss, or push counter for a player after a round."""
         if outcome not in ("win", "loss", "push"):
             raise ValueError(f"Unknown outcome: {outcome!r}")
         col = {"win": "wins", "loss": "losses", "push": "pushes"}[outcome]
@@ -181,16 +199,17 @@ class ProfileManager:
                 (username,),
             )
             self._conn.commit()
-            return self._require(username)
+            return self._fetch(username)
 
     def get(self, username: str) -> UserProfile:
+        """Fetch a player's profile. Raises KeyError if they don't exist."""
         with self._lock:
-            return self._require(username)
+            return self._fetch(username)
 
     # --- internal ---------------------------------------------------------
 
-    def _require(self, username: str) -> UserProfile:
-        """Fetch a profile row; raise KeyError if the user does not exist."""
+    def _fetch(self, username: str) -> UserProfile:
+        """Load a profile row from the DB, raising KeyError if not found."""
         row = self._conn.execute(
             "SELECT username, password_hash, credits, wins, losses, pushes "
             "FROM users WHERE username = ?",
@@ -198,4 +217,4 @@ class ProfileManager:
         ).fetchone()
         if row is None:
             raise KeyError(f"Unknown user: {username}")
-        return _row_to_profile(row)
+        return _profile_from_row(row)

@@ -1,4 +1,4 @@
-"""Blackjack hand: a list of cards plus value calculation."""
+"""A hand of cards with blackjack-aware scoring."""
 
 from __future__ import annotations
 
@@ -8,31 +8,35 @@ from .card import Card
 
 
 class Hand:
-    """A collection of cards with Blackjack-aware scoring.
+    """Holds the cards for one player (or the dealer) and knows their value.
 
-    Aces count as 11 unless that would bust the hand, in which case enough
-    aces drop to 1 to keep the score under 22.
+    Aces count as 11 unless that would bust, in which case they drop to 1.
+    Multiple aces are handled correctly too.
     """
 
     def __init__(self, cards: Iterable[Card] | None = None) -> None:
+        """Start with an optional list of cards (usually empty)."""
         self._cards: List[Card] = list(cards or [])
 
     @property
     def cards(self) -> List[Card]:
+        """A copy of the card list — mutate via add() instead."""
         return list(self._cards)
 
     def add(self, card: Card) -> None:
+        """Deal a card into this hand."""
         self._cards.append(card)
 
     def clear(self) -> None:
+        """Discard all cards — called between rounds."""
         self._cards.clear()
 
     @property
     def value(self) -> int:
-        """Best (highest non-busting) Blackjack value of this hand."""
-        total = sum(c.base_value for c in self._cards)
+        """Best blackjack score for this hand — never needlessly busts on aces."""
+        total = sum(c.point_value for c in self._cards)
         aces = sum(1 for c in self._cards if c.is_ace)
-        # Promote aces from 1 to 11 while it's safe.
+        # Promote aces from 1 → 11 as long as we don't bust.
         while aces > 0 and total + 10 <= 21:
             total += 10
             aces -= 1
@@ -40,19 +44,22 @@ class Hand:
 
     @property
     def is_soft(self) -> bool:
-        """A hand is 'soft' if at least one ace is currently counted as 11."""
-        hard_total = sum(c.base_value for c in self._cards)
+        """True when at least one ace is currently being counted as 11."""
+        hard_total = sum(c.point_value for c in self._cards)
         return any(c.is_ace for c in self._cards) and hard_total + 10 <= 21
 
     @property
     def is_blackjack(self) -> bool:
+        """Natural blackjack — exactly two cards totalling 21."""
         return len(self._cards) == 2 and self.value == 21
 
     @property
     def is_bust(self) -> bool:
+        """Over 21, regardless of how the aces fall."""
         return self.value > 21
 
     def to_list(self) -> list:
+        """Serialize the hand to a list of dicts for the wire protocol."""
         return [c.to_dict() for c in self._cards]
 
     def __len__(self) -> int:
