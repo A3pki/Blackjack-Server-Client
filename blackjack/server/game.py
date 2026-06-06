@@ -349,7 +349,7 @@ class Table:
                     if len(self._dealer.hand) >= 1 else []
                 )
                 dealer_value = (
-                    self._dealer.hand.cards[0].point_value
+                    self._dealer.hand.cards[0].base_value
                     if len(self._dealer.hand) >= 1 else 0
                 )
                 dealer_value_hidden = True

@@ -34,7 +34,7 @@ class Hand:
     @property
     def value(self) -> int:
         """Best blackjack score for this hand — never needlessly busts on aces."""
-        total = sum(c.point_value for c in self._cards)
+        total = sum(c.base_value for c in self._cards)
         aces = sum(1 for c in self._cards if c.is_ace)
         # Promote aces from 1 → 11 as long as we don't bust.
         while aces > 0 and total + 10 <= 21:
@@ -45,7 +45,7 @@ class Hand:
     @property
     def is_soft(self) -> bool:
         """True when at least one ace is currently being counted as 11."""
-        hard_total = sum(c.point_value for c in self._cards)
+        hard_total = sum(c.base_value for c in self._cards)
         return any(c.is_ace for c in self._cards) and hard_total + 10 <= 21
 
     @property
