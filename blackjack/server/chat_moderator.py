@@ -1,7 +1,7 @@
 """AI chat filter — screens messages for offensive content using Gemini Flash.
 
 If GEMINI_API_KEY isn't set, the moderator just lets everything through
-and logs a warning. The game still works fine without it.
+and logs a warning.
 """
 
 from __future__ import annotations

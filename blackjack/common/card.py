@@ -44,9 +44,5 @@ class Card:
     def to_dict(self) -> dict:
         return {"rank": self.rank, "suit": self.suit}
 
-    @classmethod
-    def from_dict(cls, data: dict) -> "Card":
-        return cls(rank=str(data["rank"]), suit=str(data["suit"]))
-
     def __str__(self) -> str:
         return f"{self.rank}{self.suit}"
